@@ -8,6 +8,7 @@ import feedparser
 from tqdm import tqdm
 import multiprocessing
 import os
+import re
 from queue import Empty
 from time import sleep
 from typing import Any, Callable, TypeVar
@@ -106,6 +107,47 @@ def _extract_text_from_tar_worker(source_url: str, paper_id: str, paper_title: s
         return file_contents["all"]
 
 
+def _result_from_rss(entry: feedparser.FeedParserDict) -> ArxivResult:
+    """Adapt an arXiv Atom announcement without another metadata API request.
+
+    Atom's dates describe announcements, not original submission dates, so do
+    not assign them to Result.published/updated. This pipeline does not use them.
+    See https://info.arxiv.org/help/atom_specifications.html.
+    """
+    paper_id = entry.get("id", "").removeprefix("oai:arXiv.org:")
+    if not re.fullmatch(r"(?:[0-9]{4}\.[0-9]{4,5}|[a-zA-Z.-]+/[0-9]{7})(?:v[0-9]+)?", paper_id):
+        raise ValueError(f"Invalid arXiv RSS paper ID: {paper_id!r}")
+    title = entry.get("title", "").strip()
+    # The Atom summary is plain text: preserve mathematics and literal '<'.
+    summary = re.sub(
+        r"^arXiv:\S+\s+Announce Type:\s*\S+\s+Abstract:\s*",
+        "", entry.get("summary", "").strip(), count=1,
+    ).strip()
+    # feedparser maps dc:creator to author, with a comma-separated author list.
+    authors = [
+        ArxivResult.Author(name.strip())
+        for name in re.split(r",\s*(?![^()]*\))", entry.get("author", ""))
+        if name.strip()
+    ]
+    if not title or not summary or not authors:
+        raise ValueError(f"Incomplete RSS metadata for {paper_id}; cannot safely recover API failure.")
+    categories = [tag["term"] for tag in entry.get("tags", []) if tag.get("term")]
+    entry_url = f"https://arxiv.org/abs/{paper_id}"
+    pdf_url = f"https://arxiv.org/pdf/{paper_id}"
+    return ArxivResult(
+        entry_id=entry_url,
+        title=title,
+        authors=authors,
+        summary=summary,
+        categories=categories,
+        primary_category=categories[0] if categories else "",
+        links=[
+            ArxivResult.Link(entry_url, rel="alternate", content_type="text/html"),
+            ArxivResult.Link(pdf_url, title="pdf", rel="related", content_type="application/pdf"),
+        ],
+    )
+
+
 @register_retriever("arxiv")
 class ArxivRetriever(BaseRetriever):
     def __init__(self, config):
@@ -114,46 +156,54 @@ class ArxivRetriever(BaseRetriever):
             raise ValueError("category must be specified for arxiv.")
 
     def _retrieve_raw_papers(self) -> list[ArxivResult]:
-        client = arxiv.Client(num_retries=10, delay_seconds=10)
+        # Keep retries bounded: RSS already contains the metadata needed below.
+        client = arxiv.Client(num_retries=2, delay_seconds=10)
         query = '+'.join(self.config.source.arxiv.category)
         include_cross_list = self.config.source.arxiv.get("include_cross_list", False)
-        # Get the latest paper from arxiv rss feed
         feed = feedparser.parse(f"https://rss.arxiv.org/atom/{query}")
+        if feed.get("status", 200) >= 400 or feed.get("bozo") or not feed.feed.get("title"):
+            raise ValueError(f"Failed to read arXiv RSS feed for {query}; refusing an empty fallback.")
         if 'Feed error for query' in feed.feed.title:
-            raise Exception(f"Invalid ARXIV_QUERY: {query}.")
-        raw_papers = []
+            raise ValueError(f"Invalid ARXIV_QUERY: {query}.")
         allowed_announce_types = {"new", "cross"} if include_cross_list else {"new"}
-        all_paper_ids = [
-            i.id.removeprefix("oai:arXiv.org:")
-            for i in feed.entries
-            if i.get("arxiv_announce_type", "new") in allowed_announce_types
-        ]
+        # Keep each paper once when it appears in several subscribed categories.
+        entries_by_id = {
+            entry.id.removeprefix("oai:arXiv.org:"): entry
+            for entry in feed.entries
+            if entry.get("arxiv_announce_type", "new") in allowed_announce_types
+        }
+        paper_ids = list(entries_by_id)
         if self.config.executor.debug:
-            all_paper_ids = all_paper_ids[:10]
+            paper_ids = paper_ids[:10]
 
-        # Get full information of each paper from arxiv api
-        bar = tqdm(total=len(all_paper_ids))
-        max_batch_retries = 5
-        batch_retry_delay = 30
-        for i in range(0, len(all_paper_ids), 20):
-            search = arxiv.Search(id_list=all_paper_ids[i:i + 20])
-            for attempt in range(max_batch_retries):
+        raw_papers = []
+        with tqdm(total=len(paper_ids)) as bar:
+            for i in range(0, len(paper_ids), 20):
+                search = arxiv.Search(id_list=paper_ids[i:i + 20])
                 try:
                     batch = list(client.results(search))
-                    bar.update(len(batch))
-                    raw_papers.extend(batch)
-                    break
-                except arxiv.HTTPError as exc:
-                    if exc.status == 429 and attempt < max_batch_retries - 1:
-                        wait = batch_retry_delay * (attempt + 1)
-                        logger.warning(f"arXiv API 429 on batch {i // 20}, retry {attempt + 1}/{max_batch_retries} in {wait}s")
-                        sleep(wait)
-                    else:
+                except (arxiv.HTTPError, arxiv.UnexpectedEmptyPageError, requests.RequestException) as exc:
+                    if isinstance(exc, arxiv.HTTPError) and not (
+                        exc.status == 429 or 500 <= exc.status < 600
+                    ):
                         raise
-            if i + 20 < len(all_paper_ids):
-                sleep(3)
-        bar.close()
-
+                    # Do not keep hitting an unavailable API for later batches.
+                    # Use this run's already-fetched feed, never stale cached data.
+                    logger.warning(
+                        f"arXiv API unavailable ({exc}); using RSS metadata for "
+                        f"the remaining {len(paper_ids) - i} papers."
+                    )
+                    batch = [
+                        _result_from_rss(entries_by_id[paper_id])
+                        for paper_id in paper_ids[i:]
+                    ]
+                    raw_papers.extend(batch)
+                    bar.update(len(batch))
+                    break
+                raw_papers.extend(batch)
+                bar.update(len(batch))
+                if i + 20 < len(paper_ids):
+                    sleep(3)
         return raw_papers
 
     def convert_to_paper(self, raw_paper: ArxivResult) -> Paper:
