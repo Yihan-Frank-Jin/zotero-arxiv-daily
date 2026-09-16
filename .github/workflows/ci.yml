@@ -1,24 +1,20 @@
-name: CI
+name: DeepSeek connection diagnostic
 on:
   workflow_dispatch:
-  push:
-    branches:
-      - main
 
-  pull_request:
-    branches:
-      - main
+permissions:
+  contents: read
 
 jobs:
-  pytest:
+  diagnose:
     runs-on: ubuntu-latest
+    timeout-minutes: 5
     steps:
-      - name: Checkout
-        uses: actions/checkout@v6
-
-      - name: Setup uv
-        uses: astral-sh/setup-uv@v7.1.4
-
-      - name: Run Pytest
-        run: |
-          uv run pytest -m "" --cov=src/zotero_arxiv_daily --cov-report=term-missing
+      - uses: actions/checkout@v6
+      - uses: astral-sh/setup-uv@v7.1.4
+      - name: Check network and configured API
+        env:
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          OPENAI_API_BASE: ${{ secrets.OPENAI_API_BASE }}
+          CUSTOM_CONFIG: ${{ vars.CUSTOM_CONFIG }}
+        run: uv run python scripts/diagnose_deepseek.py
