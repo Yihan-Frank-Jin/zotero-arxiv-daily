@@ -281,3 +281,49 @@ def test_run_no_papers_send_empty_true(config, monkeypatch):
     assert len(sent) == 1, "Email should be sent even with no papers when send_empty=true"
     _, _, body = sent[0]
     assert "text/html" in body
+
+
+def test_only_ranked_selection_is_enriched_and_failure_still_sends(config, monkeypatch):
+    """A selected paper's download failure must not drop its recommendation."""
+    from types import SimpleNamespace
+    from tests.canned_responses import make_sample_corpus, make_sample_paper
+    from zotero_arxiv_daily.protocol import Paper
+
+    config.executor.max_paper_num = 1
+    candidates = [make_sample_paper(title=title, full_text=None) for title in ("Low", "High")]
+    for paper in candidates:
+        paper.source = "arxiv"
+    events = []
+
+    def rank(papers, corpus):
+        assert all(p.full_text is None for p in papers)
+        events.append("rank")
+        return list(reversed(papers))
+
+    def enrich(paper):
+        events.append(("enrich", paper.title))
+        raise TimeoutError("full text download failed")
+
+    def tldr(paper, *args):
+        assert paper.abstract and paper.full_text is None
+        events.append(("tldr", paper.title))
+        paper.tldr = "Abstract-based summary"
+
+    executor = Executor.__new__(Executor)
+    executor.config = config
+    executor.openai_client = None
+    executor.retrievers = {"arxiv": SimpleNamespace(retrieve_papers=lambda: candidates, enrich_paper=enrich)}
+    executor.reranker = SimpleNamespace(rerank=rank)
+    executor.fetch_zotero_corpus = make_sample_corpus
+    executor.filter_corpus = lambda corpus: corpus
+    monkeypatch.setattr(Paper, "generate_tldr", tldr)
+    monkeypatch.setattr(Paper, "generate_affiliations", lambda *args: None)
+    rendered = []
+    sent = []
+    monkeypatch.setattr("zotero_arxiv_daily.executor.render_email", lambda papers: rendered.extend(papers) or "digest")
+    monkeypatch.setattr("zotero_arxiv_daily.executor.send_email", lambda cfg, body: sent.append(body))
+
+    executor.run()
+    assert events == ["rank", ("enrich", "High"), ("tldr", "High")]
+    assert rendered == [candidates[1]]
+    assert sent == ["digest"]
