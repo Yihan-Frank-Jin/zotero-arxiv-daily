@@ -113,6 +113,10 @@ class Executor:
             reranked_papers = reranked_papers[:self.config.executor.max_paper_num]
             logger.info("Generating TLDR and affiliations...")
             for p in tqdm(reranked_papers):
+                try:
+                    self.retrievers[p.source].enrich_paper(p)
+                except Exception as exc:
+                    logger.warning(f"Keeping recommendation without full text for {p.title}: {exc}")
                 p.generate_tldr(self.openai_client, self.config.llm)
                 p.generate_affiliations(self.openai_client, self.config.llm)
         elif not self.config.executor.send_empty:

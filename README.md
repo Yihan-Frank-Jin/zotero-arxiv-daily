@@ -104,6 +104,21 @@ executor:
   source: ['arxiv']
 ```
 Set `source.arxiv.include_cross_list: true` if you want cross-listed papers included.
+
+arXiv recommendations use the daily Atom feed directly for titles, authors, and
+abstracts, without querying `export.arxiv.org/api/query` for each batch. All
+eligible candidates are ranked by abstract before `executor.max_paper_num` is
+applied. Full text is fetched only for the selected arXiv recommendations, using
+source, HTML, and PDF fallbacks. If full text is unavailable, the paper stays in
+the digest with an abstract-based TLDR and no extracted affiliations. A failed or
+malformed feed is reported as an error rather than silently treated as an empty day.
+
+arXiv downloads use explicit timeouts and at most three HTTP attempts. Requests
+are spaced by at least three seconds; transient errors use 30/60-second backoff.
+`Retry-After` is respected: a cooldown longer than 60 seconds ends that request
+instead of retrying early. Full-text extraction also has a hard timeout for each
+format (180 seconds for source/PDF and 90 seconds for HTML).
+
 >[!NOTE]
 > `${oc.env:XXX,yyy}` means the value of the environment variable `XXX`. If the variable is not set, the default value `yyy` will be used.
 
